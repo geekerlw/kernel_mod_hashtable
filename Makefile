@@ -1,6 +1,7 @@
 ifneq  ($(KERNELRELEASE),)
 
-obj-m := hashtable.o
+obj-m += hashtable.o
+obj-m += hashtable_unit.o
 
 else
 

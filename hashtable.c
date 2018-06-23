@@ -12,13 +12,11 @@
  * copies or substantial portions of the Software.
  */
 
-#include <linux/stddef.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/list.h>
-
 
 #define HASH_TABLE_SIZE (8)
 
@@ -55,7 +53,7 @@ static bool ht_search_by_key(const hash_key_t key, unsigned int *ht_bucket_index
 	unsigned int index = ht_hash_create(key);
 
 	hlist_for_each_entry(tmp_data, g_hash_table + index, hnode) {
-		if(strcmp(key, tmp_data->key) == 0) {
+		if(strncmp(key, tmp_data->key, strlen(key)) == 0) {
 			break;
 		}
 	}
@@ -66,26 +64,30 @@ static bool ht_search_by_key(const hash_key_t key, unsigned int *ht_bucket_index
 	return tmp_data != NULL;
 }
 
-static void ht_data_add(ht_data_t *new_data)
+void ht_data_add(const hash_key_t key, const hash_value_t value)
 {
 	unsigned int index;
 	ht_data_t *data;
 
-	
 	// find if the node is exist
-	if(ht_search_by_key(new_data->key, &index, &data)) {
+	if(ht_search_by_key(key, &index, &data)) {
 		// the key is already exist, update it ?
-		data->value = new_data->value;
+		data->value = value;
 		return;
 	}
 
 	// if not find exist node, copy as a new node
 	data = (ht_data_t *)kmalloc(sizeof(ht_data_t), GFP_KERNEL);
-	if(data == NULL) {
+	data->key = (char *) kmalloc(sizeof(char) * (strlen(key) + 1), GFP_KERNEL);
+	data->value = (char *) kmalloc(sizeof(char) * (strlen(value) + 1), GFP_KERNEL);
+
+	if(data == NULL || data->key == NULL || data->value == NULL) {
+		printk("debug: kmalloc failed\n");
 		return;
 	}
 
-	memcpy(data, new_data, sizeof(ht_data_t));
+	memcpy(data->key, key, (strlen(key) + 1));
+	memcpy(data->value, value, (strlen(value) + 1));
 
 	INIT_HLIST_NODE(&(data->hnode));
 
@@ -94,28 +96,34 @@ static void ht_data_add(ht_data_t *new_data)
 
 	return;
 }
+EXPORT_SYMBOL(ht_data_add);
 
-static int ht_data_remove(const hash_key_t key)
+void ht_data_remove(const hash_key_t key)
 {
 	unsigned int index;
 	ht_data_t *data;
 
 	if(!ht_search_by_key(key, &index, &data)) {
 		// do not find the key
-		return -1;
+		return;
 	}
 
 	hlist_del_init(&(data->hnode));
 
+	kfree(data->key);
+	data->key = NULL;
+	kfree(data->value);
+	data->value = NULL;
 	kfree(data);
+	data = NULL;
 
-	return 0;
+	return;
 }
+EXPORT_SYMBOL(ht_data_remove);
 
 
 // query the value of the key
-static int ht_data_query(const hash_key_t key, hash_value_t *value)
-{
+int ht_data_query(const hash_key_t key, hash_value_t *value) {
 	unsigned int index;
 	ht_data_t *data;
 
@@ -128,19 +136,61 @@ static int ht_data_query(const hash_key_t key, hash_value_t *value)
 
 	return 0;
 }
+EXPORT_SYMBOL(ht_data_query);
 
-static int hashtable_init(void)
+/*
+static void hashtable_unit_test(void)
+{
+	char key[] = "key1";
+	char value[] = "value1";
+
+	char *p = (char *) kmalloc(sizeof(char), GFP_KERNEL);
+	char *p1 = (char *) kmalloc(sizeof(char), GFP_KERNEL);
+
+	// insert test
+	ht_data_add(key, value);
+	printk("debug: add the key: %s, value: %s\n", key, value);
+
+	// query test
+	ht_data_query(key, &p);
+	printk("debug: query out the data: %s\n", p);
+	kfree(p);
+
+	// remove test
+	if(ht_data_remove(key) == 0) {
+		printk("debug: remove the key: %s\n", key);
+		// query again
+		if(ht_data_query(key, &p1) == 0) {
+			printk("debug: query out the key: %s, value: %s\n", key, p1);
+		} else {
+			printk("debug: query failed, not found\n");
+		}
+	} else {
+		printk("debug: remove the key failed, key: %s\n", key);
+	}
+	kfree(p1);	
+
+	return;
+}
+*/
+
+static int __init hashtable_init(void)
 {
 	unsigned int i;
+
 	// hash table bucket init	
 	for(i = 0; i < HASH_TABLE_SIZE; i++) {
 		INIT_HLIST_HEAD(g_hash_table + i);
 	}
 
+	//hashtable_unit_test();
+	
+	printk("hashtable: module init success\n");
+
 	return 0;
 }
 
-static void hashtable_exit(void)
+static void __exit hashtable_exit(void)
 {
 	unsigned int i;
 	ht_data_t *data;
@@ -151,8 +201,11 @@ static void hashtable_exit(void)
 		hlist_for_each_entry_safe(data, tmp_hnode, g_hash_table + i, hnode) {
 			hlist_del_init(&(data->hnode));
 			kfree(data);
+			data = NULL;
 		}
 	}
+
+	printk("hashtable: module exit success\n");
 
 	return;
 }
