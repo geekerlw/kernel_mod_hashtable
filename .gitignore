@@ -10,3 +10,4 @@ Module.symvers
 *.mod.o
 modules.order
 tags
+a.out
