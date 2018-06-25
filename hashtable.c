@@ -19,6 +19,7 @@
 #include <linux/syscalls.h>
 #include <linux/kallsyms.h>
 #include <linux/proc_fs.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/list.h>
 #include <linux/slab.h>
@@ -45,7 +46,8 @@ typedef struct ht_data{
 	struct hlist_node hnode;
 }ht_data_t;
 
-struct hlist_head g_hash_table[HASH_TABLE_SIZE];
+static struct hlist_head g_hash_table[HASH_TABLE_SIZE];
+static rwlock_t g_hash_table_rwlock[HASH_TABLE_SIZE];
 
 static unsigned long g_syscall_fake_addr;
 static void *g_syscall_fake_func;
@@ -79,11 +81,15 @@ static bool ht_search_by_key(const hash_key_t key, unsigned int *ht_bucket_index
 	// get the hash bucket index
 	unsigned int index = ht_hash_create(key);
 
+	// read lock
+	read_lock(&g_hash_table_rwlock[index]);
 	hlist_for_each_entry(tmp_data, g_hash_table + index, hnode) {
 		if(strncmp(key, tmp_data->key, strlen(key)) == 0) {
 			break;
 		}
 	}
+	// read unlock
+	read_unlock(&g_hash_table_rwlock[index]);
 
 	*ht_bucket_index = index;
 	*data = tmp_data;
@@ -99,7 +105,11 @@ void ht_data_add(const hash_key_t key, const hash_value_t value)
 	// find if the node is exist
 	if(ht_search_by_key(key, &index, &data)) {
 		// the key is already exist, update it ?
+		// write lock
+		write_lock(&g_hash_table_rwlock[index]);
 		data->value = value;
+		// write unlock
+		write_unlock(&g_hash_table_rwlock[index]);
 		return;
 	}
 
@@ -118,8 +128,12 @@ void ht_data_add(const hash_key_t key, const hash_value_t value)
 
 	INIT_HLIST_NODE(&(data->hnode));
 
+	// write lock
+	write_lock(&g_hash_table_rwlock[index]);
 	// add the node to the hlist
 	hlist_add_head(&(data->hnode), g_hash_table + index);  // index: table bucket index
+	// write unlock
+	write_unlock(&g_hash_table_rwlock[index]);
 
 	return;
 }
@@ -134,7 +148,12 @@ void ht_data_remove(const hash_key_t key)
 		return;
 	}
 
+	// write lock
+	write_lock(&g_hash_table_rwlock[index]);
+	// hash node del
 	hlist_del_init(&(data->hnode));
+	//write unlock
+	write_unlock(&g_hash_table_rwlock[index]);
 
 	kfree(data->key);
 	data->key = NULL;
@@ -328,6 +347,7 @@ static int __init hashtable_init(void)
 	// hash table bucket init	
 	for(i = 0; i < HASH_TABLE_SIZE; i++) {
 		INIT_HLIST_HEAD(g_hash_table + i);
+		rwlock_init(&g_hash_table_rwlock[i]);
 	}
 
 	// system call replace
