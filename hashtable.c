@@ -316,6 +316,7 @@ static ssize_t proc_node_write(struct file *file, const char __user *buffer, siz
 }
 
 static struct file_operations proc_node_fops = {
+	.owner = THIS_MODULE,
 	.read = proc_node_read,
 	.write = proc_node_write,
 };
