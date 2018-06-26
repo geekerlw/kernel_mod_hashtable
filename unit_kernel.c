@@ -17,53 +17,40 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 
-extern void ht_data_add(const char*, const char*);
-extern void ht_data_remove(const char*);
-extern int ht_data_query(const char*, char**);
+extern void ht_data_add(const char*, const unsigned int, const char*, unsigned int);
+extern void ht_data_remove(const char*, const unsigned int);
+extern int ht_data_query(const char*, const unsigned int, char**, unsigned int*);
 
 static int __init unit_init(void)
 {
-	char *p, *p1;
+	unsigned int vsize;
+	unsigned long store = 0;
 	char key[] = "key1";
 	char value[] = "value1";
+	char *p = (char *)store;
+	char *q = (char *)store;
 
-	p = (char *) kmalloc(sizeof(char), GFP_KERNEL);
-	p1 = (char *) kmalloc(sizeof(char), GFP_KERNEL);
-	if (p == NULL || p1 == NULL) {
-		printk("debug: memory alloc failed\n");
-		return -1;
-	}
-
+	printk("unit: hashtable unit test module init\n");
 	// insert key - value
-	ht_data_add(key, value);
-	printk("debug: success to store the key: %s, value: %s\n", key, value);
+	ht_data_add(key, strlen(key) + 1, value, strlen(value) + 1);
+	printk("unit: success to store the key: %s, value: %s\n", key, value);
 
 	// query key
-	if(ht_data_query(key, &p) == 0) {
-		printk("debug: success to find the key: %s, value: %s\n", key, p);
+	if(ht_data_query(key, strlen(key) + 1, &p, &vsize) == 0) {
+		printk("unit: success to find the key: %s, value: %s\n", key, p);
 	} else {
-		printk("debug: failed to find the key: %s\n", key);
-	}
-
-	if (p) {
-		kfree(p);
-		p = NULL;
+		printk("unit: failed to find the key: %s\n", key);
 	}
 
 	// remove key
-	ht_data_remove(key);
-	printk("debug: remove the key: %s, query again\n", key);
+	ht_data_remove(key, strlen(key) + 1);
+	printk("unit: remove the key: %s, query again\n", key);
 
 	// remove test query
-	if(ht_data_query(key, &p1) == 0) {
-		printk("debug: success to find the key: %s, value: %s\n", key, p1);
+	if(ht_data_query(key, strlen(key) + 1, &q, &vsize) == 0) {
+		printk("unit: success to find the key: %s, value: %s\n", key, q);
 	} else {
-		printk("debug: failed to find the key: %s\n", key);
-	}
-
-	if (p1) {
-		kfree(p1);
-		p1 = NULL;
+		printk("unit: failed to find the key: %s\n", key);
 	}
 
 	return 0;
@@ -71,7 +58,7 @@ static int __init unit_init(void)
 
 static void __exit unit_exit(void)
 {
-	printk("debug: hashtable unit test module exit\n");
+	printk("unit: hashtable unit test module exit\n");
 	return;
 }
 

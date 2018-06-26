@@ -28,13 +28,13 @@ typedef struct bench_func {
 }bench_func_t;
 
 #define TIME_NANOSECOND (1000 * 1000 * 1000)
-#define MAX_INDEX_SIZE	(1 * 100)
-#define MAX_THREAD_SIZE	(1)
+#define MAX_INDEX_SIZE	(100 * 1000)
+#define MAX_THREAD_SIZE	(4)
 #define MAX_KV_SIZE		(16)
 
-extern void ht_data_add(const char *key, const char *value);
-extern void ht_data_remove(const char *key);
-extern void ht_data_query(const char *key, char **value);
+extern void ht_data_add(const char *key, const unsigned int, const char *value, unsigned int);
+extern void ht_data_remove(const char *key, const unsigned int);
+extern void ht_data_query(const char *key, const unsigned int, char **value, unsigned int*);
 
 static struct task_struct *task_benchmark;
 
@@ -60,7 +60,7 @@ static int thread_func_add(void *data)
 	while(!kthread_should_stop()) {
 		if(atomic_read(&atomic_index) < MAX_INDEX_SIZE) {
 			hash_kv_constructor(key, value);
-			ht_data_add(key, value);
+			ht_data_add(key, strlen(key) + 1, value, strlen(value) + 1);
 			//printk("benchmark: add: key: %s, value: %s\n", key, value);
 		}
 	}
@@ -76,7 +76,7 @@ static int thread_func_remove(void *data)
 	while(!kthread_should_stop()) {
 		if(atomic_read(&atomic_index) < MAX_INDEX_SIZE) {
 			hash_kv_constructor(key, value);
-			ht_data_remove(key);
+			ht_data_remove(key, strlen(key) + 1);
 			//printk("benchmark: remove: key: %s, value: %s\n", key, value);
 		}
 	}
@@ -88,13 +88,14 @@ static int thread_func_query(void *data)
 {
 	char key[MAX_KV_SIZE] = { 0 };
 	char value[MAX_KV_SIZE] = { 0 };
+	unsigned int vsize = 0;
 	unsigned long store = 0;
 	char *p = (char *)store;
 
 	while(!kthread_should_stop()) {
 		if(atomic_read(&atomic_index) < MAX_INDEX_SIZE) {
 			hash_kv_constructor(key, value);
-			ht_data_query(key, &p);
+			ht_data_query(key, strlen(key) + 1, &p, &vsize);
 			//printk("benchmark: query: key: %s, value: %s\n", key, p);
 		}
 	}

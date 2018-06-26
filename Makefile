@@ -2,6 +2,7 @@ ifneq  ($(KERNELRELEASE),)
 
 obj-m += hashtable.o
 obj-m += unit_kernel.o
+obj-m += benchmark_kernel.o
 
 else
 

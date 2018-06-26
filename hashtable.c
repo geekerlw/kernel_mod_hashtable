@@ -39,10 +39,13 @@ enum HASH_CMD {
 
 typedef char* hash_key_t;
 typedef char* hash_value_t;
+typedef unsigned int hash_len_t;
 
 typedef struct ht_data{
 	hash_key_t key;
 	hash_value_t value;
+	hash_len_t ksize;
+	hash_len_t vsize;
 	struct hlist_node hnode;
 }ht_data_t;
 
@@ -74,8 +77,9 @@ static unsigned int ht_hash_create(hash_key_t key)
 }
 
 // get the bucket index and current node by key
-static bool ht_search_by_key(const hash_key_t key, unsigned int *ht_bucket_index, ht_data_t **data)
+static bool ht_node_search(const hash_key_t key, const hash_len_t ksize, unsigned int *ht_bucket_index, ht_data_t **data)
 {
+	bool ret = false;
 	ht_data_t *tmp_data;
 
 	// get the hash bucket index
@@ -84,7 +88,10 @@ static bool ht_search_by_key(const hash_key_t key, unsigned int *ht_bucket_index
 	// read lock
 	read_lock(&g_hash_table_rwlock[index]);
 	hlist_for_each_entry(tmp_data, g_hash_table + index, hnode) {
-		if(strncmp(key, tmp_data->key, strlen(key)) == 0) {
+		if(memcmp(key, (hash_key_t)(tmp_data->key), ksize) == 0
+				&& ksize == tmp_data->ksize) {
+			//printk("debug: query key: %s, store key: %s\n", key, tmp_data->key);
+			ret = true;
 			break;
 		}
 	}
@@ -94,44 +101,77 @@ static bool ht_search_by_key(const hash_key_t key, unsigned int *ht_bucket_index
 	*ht_bucket_index = index;
 	*data = tmp_data;
 
-	return tmp_data != NULL;
+	return ret;
 }
 
-void ht_data_add(const hash_key_t key, const hash_value_t value)
+static inline ht_data_t *ht_node_create(const hash_key_t key, const hash_len_t ksize, const hash_value_t value, const hash_len_t vsize)
+{
+	ht_data_t *data;
+
+	data = (ht_data_t *) kmalloc(sizeof(ht_data_t), GFP_KERNEL);
+	data->key = (hash_key_t) kmalloc(sizeof(hash_key_t) * ksize, GFP_KERNEL);
+	data->value = (hash_value_t) kmalloc(sizeof(hash_value_t) * vsize, GFP_KERNEL);
+
+	if(data == NULL || data->key == NULL || data->value == NULL) {
+		printk("hashtable: kmalloc failed\n");
+		return NULL;
+	}
+
+	memcpy(data->key, key, ksize);
+	memcpy(data->value, value, vsize);
+	data->ksize = ksize;
+	data->vsize = vsize;
+
+	INIT_HLIST_NODE(&(data->hnode));
+
+	return data;
+}
+
+static inline void ht_node_remove(ht_data_t *data)
+{
+	if (!data) return;
+
+	hlist_del_init(&(data->hnode));
+
+	if(data->key) {
+		kfree(data->key);
+		data->key = NULL;
+	}
+	if(data->value) {
+		kfree(data->value);
+		data->value = NULL;
+	}
+
+	kfree(data);
+	data = NULL;
+
+	return;
+}
+
+
+void ht_data_add(const hash_key_t key, const hash_len_t ksize, const hash_value_t value, const hash_len_t vsize)
 {
 	unsigned int index;
 	ht_data_t *data;
 
 	// find if the node is exist
-	if(ht_search_by_key(key, &index, &data)) {
+	if(ht_node_search(key, ksize, &index, &data)) {
 		// the key is already exist, update it ?
 		// write lock
 		write_lock(&g_hash_table_rwlock[index]);
-		data->value = value;
+		ht_node_remove(data);
 		// write unlock
 		write_unlock(&g_hash_table_rwlock[index]);
-		return;
 	}
 
 	// if not find exist node, copy as a new node
-	data = (ht_data_t *)kmalloc(sizeof(ht_data_t), GFP_KERNEL);
-	data->key = (char *) kmalloc(sizeof(char) * (strlen(key) + 1), GFP_KERNEL);
-	data->value = (char *) kmalloc(sizeof(char) * (strlen(value) + 1), GFP_KERNEL);
-
-	if(data == NULL || data->key == NULL || data->value == NULL) {
-		printk("hashtable: kmalloc failed\n");
-		return;
-	}
-
-	memcpy(data->key, key, (strlen(key) + 1));
-	memcpy(data->value, value, (strlen(value) + 1));
-
-	INIT_HLIST_NODE(&(data->hnode));
+	data = ht_node_create(key, ksize, value, vsize);
+	if (data == NULL) return;
 
 	// write lock
 	write_lock(&g_hash_table_rwlock[index]);
 	// add the node to the hlist
-	hlist_add_head(&(data->hnode), g_hash_table + index);  // index: table bucket index
+	hlist_add_head(&(data->hnode), g_hash_table + index);
 	// write unlock
 	write_unlock(&g_hash_table_rwlock[index]);
 
@@ -139,28 +179,21 @@ void ht_data_add(const hash_key_t key, const hash_value_t value)
 }
 EXPORT_SYMBOL(ht_data_add);
 
-void ht_data_remove(const hash_key_t key)
+void ht_data_remove(const hash_key_t key, const hash_len_t ksize)
 {
 	unsigned int index;
 	ht_data_t *data;
 
-	if(!ht_search_by_key(key, &index, &data)) {
+	if(!ht_node_search(key, ksize, &index, &data)) {
 		return;
 	}
 
 	// write lock
 	write_lock(&g_hash_table_rwlock[index]);
 	// hash node del
-	hlist_del_init(&(data->hnode));
+	ht_node_remove(data);
 	//write unlock
 	write_unlock(&g_hash_table_rwlock[index]);
-
-	kfree(data->key);
-	data->key = NULL;
-	kfree(data->value);
-	data->value = NULL;
-	kfree(data);
-	data = NULL;
 
 	return;
 }
@@ -168,15 +201,16 @@ EXPORT_SYMBOL(ht_data_remove);
 
 
 // query the value of the key
-int ht_data_query(const hash_key_t key, hash_value_t *value) {
+int ht_data_query(const hash_key_t key, const hash_len_t ksize, hash_value_t *value, hash_len_t *vsize) {
 	unsigned int index;
 	ht_data_t *data;
 
-	if(!ht_search_by_key(key, &index, &data)) {
+	if(!ht_node_search(key, ksize, &index, &data)) {
 		return -1;
 	}
 
 	*value = data->value;
+	*vsize = data->vsize;
 
 	return 0;
 }
@@ -203,7 +237,7 @@ static void page_addr_ro(unsigned long address)
 	return;
 }
 
-asmlinkage long sys_hashtable(int cmd, const hash_key_t key, hash_value_t *value)
+asmlinkage long sys_hashtable(int cmd, const hash_key_t key, const hash_len_t ksize, hash_value_t *value, hash_len_t *vsize)
 {
 	int ret = 0;
 	printk("hashtable: call the hashtable via syscall\n");
@@ -211,15 +245,15 @@ asmlinkage long sys_hashtable(int cmd, const hash_key_t key, hash_value_t *value
 	switch(cmd) {
 		case HASH_ADD:
 			printk("hashtable: run add, key: %s, value: %s\n", key, *value);
-			ht_data_add(key, *value);
+			ht_data_add(key, ksize, *value, *vsize);
 			break;
 		case HASH_DEL:
 			printk("hashtable: run del, key: %s\n", key);
-			ht_data_remove(key);
+			ht_data_remove(key, ksize);
 			break;
 		case HASH_GET:
 			printk("hashtable: run get, key: %s\n", key);
-			ret = ht_data_query(key, value);
+			ret = ht_data_query(key, ksize, value, vsize);
 			if (ret == 0) {
 				printk("hashtable: query out the value: %s\n", *value);
 			} else {
@@ -233,7 +267,7 @@ asmlinkage long sys_hashtable(int cmd, const hash_key_t key, hash_value_t *value
 	return (long)ret;
 }
 
-static int syscall_init_module(void)
+static int sys_init_module(void)
 {
 	unsigned long *p;
 	// get the syscall table address
@@ -258,7 +292,7 @@ static int syscall_init_module(void)
 	return 0;
 }
 
-static int syscall_cleanup_module(void)
+static int sys_cleanup_module(void)
 {
 	unsigned long *p;
 	p = (unsigned long *)g_syscall_fake_addr;
@@ -303,8 +337,7 @@ static ssize_t proc_node_write(struct file *file, const char __user *buffer, siz
 			key = p;
 			value = strsep(&s, delim);
 			printk("hashtable: add key: %s, value: %s\n", key, value);
-			ht_data_add(key, value);
-			sprintf(proc_msg, "add key: %s, value: %s\n", key, value);
+			ht_data_add(key, strlen(key) + 1, value, strlen(value) + 1);
 		}
 	}
 	// delete key
@@ -312,21 +345,19 @@ static ssize_t proc_node_write(struct file *file, const char __user *buffer, siz
 		for(p = strsep(&s, delim); p != NULL; p = strsep(&s, delim)) {
 			key = p;
 			printk("hashtable: del key: %s\n", key);
-			ht_data_remove(key);
-			sprintf(proc_msg, "del key: %s\n", key);
+			ht_data_remove(key, strlen(key) + 1);
 		}
 	}
 	// query key
 	else if (strncmp("get", msg, strlen("get")) == 0) {
 		for(p = strsep(&s, delim); p != NULL; p = strsep(&s, delim)) {
-			char *value;
+			hash_value_t value;
+			hash_len_t vsize;
 			key = p;
-			if(ht_data_query(key, &value) == 0 ) {
+			if(ht_data_query(key, strlen(key) + 1, &value, &vsize) == 0 ) {
 				printk("hashtable: found the key: %s, value: %s\n", key, value);
-				sprintf(proc_msg, "query out the key: %s, value: %s\n", key, value);
 			} else {
 				printk("hashtable: not found the key: %s\n", key);
-				sprintf(proc_msg, "query failed, no such key: %s\n", key);
 			}
 		}
 	}
@@ -351,7 +382,7 @@ static int __init hashtable_init(void)
 	}
 
 	// system call replace
-	syscall_init_module();
+	sys_init_module();
 
 	// procfs node create
 	if((proc_node_entry = proc_create(proc_node_name, S_IFREG | S_IRUGO | S_IWUGO, NULL, &proc_node_fops)) == NULL) {
@@ -374,15 +405,19 @@ static void __exit hashtable_exit(void)
 	proc_remove(proc_node_entry);
 
 	// system call revert
-	syscall_cleanup_module();
+	sys_cleanup_module();
 
 	// hash table clear
 	for(i = 0; i < HASH_TABLE_SIZE; i++) {
+		// write lock
+		write_lock(&g_hash_table_rwlock[i]);
 		hlist_for_each_entry_safe(data, tmp_hnode, g_hash_table + i, hnode) {
 			hlist_del_init(&(data->hnode));
 			kfree(data);
 			data = NULL;
 		}
+		// write unlock
+		write_unlock(&g_hash_table_rwlock[i]);
 	}
 
 	printk("hashtable: module exit success\n");
