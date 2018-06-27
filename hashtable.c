@@ -19,15 +19,29 @@
 #include <linux/syscalls.h>
 #include <linux/kallsyms.h>
 #include <linux/proc_fs.h>
+#include <linux/atomic.h>
+#include <asm/atomic.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/list.h>
 #include <linux/slab.h>
 
-#define HASH_TABLE_SIZE	(8)
+#define HASH_TABLE_MIN_SIZE	(8)
+#define HASH_TABLE_MAX_SIZE	(INT_MAX)
 #define HASH_KEY_MAX_LEN	(256)
 #define HASH_VALUE_MAX_LEN	(512)
 #define MAX_BUF_SIZE (HASH_KEY_MAX_LEN + HASH_VALUE_MAX_LEN + 16)
+
+#define SWAP(x, n, y) { n = x; x = y, y = n; }
+
+#define HT_ERR(fmt, ...) \
+    printk(KERN_ERR "hashtable - %s[%04u]: " fmt, __func__, __LINE__, ##__VA_ARGS__)
+
+#define HT_INFO(fmt, ...) \
+    printk(KERN_INFO "hashtable - %s[%04u]: " fmt, __func__, __LINE__, ##__VA_ARGS__)
+
+#define HT_DEBUG(fmt, ...) \
+    printk(KERN_DEBUG "hashtable - %s[%04u]: " fmt, __func__, __LINE__, ##__VA_ARGS__)
 
 #define SYSCALL_FAKE_NUM	(223)
 
@@ -37,11 +51,39 @@ enum HASH_CMD {
 	HASH_GET
 };
 
+enum HASH_NODE_POS {
+	HASH_NOT_FOUND,
+	HASH_IN_MAJOR,
+	HASH_IN_MINOR
+};
+
+enum HASH_TABLE_RESIZE {
+	SIZE_INCRESE,
+	SIZE_DECRESE
+};
+
 typedef char* hash_key_t;
 typedef char* hash_value_t;
 typedef unsigned int hash_len_t;
 
-typedef struct ht_data{
+typedef struct hash_entry {
+	struct hlist_head *bucket;
+	rwlock_t *rwlock;
+	unsigned int size;
+}hash_entry_t;
+
+typedef struct hash_table {
+	hash_entry_t *major;
+	hash_entry_t *minor;
+	unsigned int size;
+	unsigned int sizemark;
+	unsigned int load;
+	unsigned int rehash_idx;
+	bool rehashed;
+	rwlock_t rwlock;
+}hash_table_t;
+
+typedef struct ht_data {
 	hash_key_t key;
 	hash_value_t value;
 	hash_len_t ksize;
@@ -49,8 +91,8 @@ typedef struct ht_data{
 	struct hlist_node hnode;
 }ht_data_t;
 
-static struct hlist_head g_hash_table[HASH_TABLE_SIZE];
-static rwlock_t g_hash_table_rwlock[HASH_TABLE_SIZE];
+static hash_table_t ht;
+static atomic_t g_major_members = ATOMIC_INIT(0);
 
 static unsigned long g_syscall_fake_addr;
 static void *g_syscall_fake_func;
@@ -61,10 +103,18 @@ MODULE_PARM_DESC(g_syscall_table_addr, "syscall table address");
 static const char *proc_node_name = "hashtable";
 static struct proc_dir_entry *proc_node_entry;
 
-static char proc_msg[MAX_BUF_SIZE];
 
-// BKDRHash
-static unsigned int ht_hash_create(hash_key_t key)
+/****************************************
+ * ---							---
+ * ---		DATA FUNCTIONS		---
+ * ---							---
+ * note: all function thread safety.
+ ***************************************/
+
+/**
+ * BKDRHash hash create
+ */
+static unsigned int ht_hash_create(const char *key)
 {
 	unsigned int seed = 131;
 	register unsigned int hash = 0;
@@ -73,47 +123,29 @@ static unsigned int ht_hash_create(hash_key_t key)
 		hash = hash * seed + (*key++);
 	}
 
-	return (hash & 0x7FFFFFFF) % HASH_TABLE_SIZE;
+	return (hash & 0x7FFFFFFF);
 }
 
-// get the bucket index and current node by key
-static bool ht_node_search(const hash_key_t key, const hash_len_t ksize, unsigned int *ht_bucket_index, ht_data_t **data)
-{
-	bool ret = false;
-	ht_data_t *tmp_data;
-
-	// get the hash bucket index
-	unsigned int index = ht_hash_create(key);
-
-	// read lock
-	read_lock(&g_hash_table_rwlock[index]);
-	hlist_for_each_entry(tmp_data, g_hash_table + index, hnode) {
-		if(memcmp(key, (hash_key_t)(tmp_data->key), ksize) == 0
-				&& ksize == tmp_data->ksize) {
-			//printk("debug: query key: %s, store key: %s\n", key, tmp_data->key);
-			ret = true;
-			break;
-		}
-	}
-	// read unlock
-	read_unlock(&g_hash_table_rwlock[index]);
-
-	*ht_bucket_index = index;
-	*data = tmp_data;
-
-	return ret;
-}
-
+/**
+ * create a base key-value pair
+ */
 static inline ht_data_t *ht_node_create(const hash_key_t key, const hash_len_t ksize, const hash_value_t value, const hash_len_t vsize)
 {
 	ht_data_t *data;
 
 	data = (ht_data_t *) kmalloc(sizeof(ht_data_t), GFP_KERNEL);
-	data->key = (hash_key_t) kmalloc(sizeof(hash_key_t) * ksize, GFP_KERNEL);
-	data->value = (hash_value_t) kmalloc(sizeof(hash_value_t) * vsize, GFP_KERNEL);
+	if (!data)
+		return NULL;
 
-	if(data == NULL || data->key == NULL || data->value == NULL) {
-		printk("hashtable: kmalloc failed\n");
+	data->key = (hash_key_t) kmalloc(sizeof(hash_key_t) * ksize, GFP_KERNEL);
+	if (!data->key) {
+		kfree(data->key);
+		return NULL;
+	}
+	data->value = (hash_value_t) kmalloc(sizeof(hash_value_t) * vsize, GFP_KERNEL);
+	if (!data->value) {
+		kfree(data->key);
+		kfree(data);
 		return NULL;
 	}
 
@@ -127,9 +159,13 @@ static inline ht_data_t *ht_node_create(const hash_key_t key, const hash_len_t k
 	return data;
 }
 
-static inline void ht_node_remove(ht_data_t *data)
+/**
+ * destroy a key-pair node
+ */
+static inline void ht_node_destroy(ht_data_t *data)
 {
-	if (!data) return;
+	if (!data)
+		return;
 
 	hlist_del_init(&(data->hnode));
 
@@ -141,71 +177,425 @@ static inline void ht_node_remove(ht_data_t *data)
 		kfree(data->value);
 		data->value = NULL;
 	}
-
 	kfree(data);
-	data = NULL;
+
+	return;
+}
+
+/**
+ * hashtable entry create
+ */
+static inline hash_entry_t *ht_entry_create(int size)
+{
+	int i;
+	hash_entry_t *entry;
+	
+	entry = (hash_entry_t *) kmalloc(sizeof(hash_entry_t), GFP_KERNEL);
+	if (!entry)
+		return NULL;
+
+	entry->size = size;
+
+	entry->bucket = (struct hlist_head*) kmalloc(sizeof(struct hlist_head) * size, GFP_KERNEL);
+	if (!entry->bucket) {
+		kfree(entry);
+		return NULL;
+	}
+	entry->rwlock = (rwlock_t *) kmalloc(sizeof(rwlock_t *) * size, GFP_KERNEL);
+	if (!entry->rwlock) {
+		kfree(entry->bucket);
+		kfree(entry);
+		return NULL;
+	}
+	// sub init
+	for(i = 0; i < size; i++) {
+		INIT_HLIST_HEAD(entry->bucket + i);
+		rwlock_init(entry->rwlock + i);
+	}
+
+	return entry;
+}
+
+/**
+ * destroy the entry, lock out layer
+ */
+static void ht_entry_destroy(hash_entry_t *entry)
+{
+	int i;
+	ht_data_t *pos;
+	struct hlist_node *n;
+	
+	if (!entry)
+		return;
+
+	for(i = 0; i < entry->size; i++) {
+		// write lock
+		write_lock(entry->rwlock + i);
+
+		hlist_for_each_entry_safe(pos, n, entry->bucket + i, hnode) {
+			ht_node_destroy(pos);
+		};
+		// write unlock
+		write_unlock(entry->rwlock + i);
+	}
+
+	// memory free
+	kfree(entry->rwlock);
+	entry->rwlock = NULL;
+	kfree(entry->bucket);
+	entry->bucket = NULL;
+
+	kfree(entry);
+
+	return;
+}
+
+/**
+ * hash table size lock read
+ */
+static inline void ht_table_size_lock_read(unsigned int *size, unsigned int *load)
+{
+	if (!size || !load)
+		return;
+	
+	// read lock
+	read_lock(&ht.rwlock);
+	*size = ht.size;
+	*load = ht.load;
+	// read unlock
+	read_unlock(&ht.rwlock);
+
+	return;
+}
+
+/**
+ * hash table size lock write
+ */
+static inline void ht_table_size_lock_write(unsigned int size, unsigned int load)
+{
+	// write lock
+	write_lock(&ht.rwlock);
+	ht.size = size;
+	ht.load = load;
+	// write unlock
+	write_unlock(&ht.rwlock);
+
+	return;
+}
+
+/**
+ *  whether minor hash table is rehashed complete
+ */
+static inline bool ht_table_isrehashed(unsigned int *rehash_idx, unsigned int *sizemark)
+{
+	bool ret;
+	// read lock
+	read_lock(&ht.rwlock);
+	ret = ht.rehashed;
+	*rehash_idx = ht.rehash_idx;
+	*sizemark = ht.sizemark;
+	// read unlock
+	read_unlock(&ht.rwlock);
+
+	return ret;
+}
+
+/**
+ * updata minor table rehash state
+ */
+static inline void ht_table_set_rehash(bool rehashed, const unsigned int rehash_idx, const unsigned int sizemark)
+{
+	// write lock
+	write_lock(&ht.rwlock);
+	ht.rehashed = rehashed;
+	ht.rehash_idx = rehash_idx;
+	ht.sizemark = sizemark;
+	// write unlock
+	write_unlock(&ht.rwlock);
 
 	return;
 }
 
 
-void ht_data_add(const hash_key_t key, const hash_len_t ksize, const hash_value_t value, const hash_len_t vsize)
-{
-	unsigned int index;
-	ht_data_t *data;
+/****************************************
+ * ---							---
+ * ---		LOGIC FUNCTIONS		---
+ * ---							---
+ ***************************************/
 
-	// find if the node is exist
-	if(ht_node_search(key, ksize, &index, &data)) {
-		// the key is already exist, update it ?
-		// write lock
-		write_lock(&g_hash_table_rwlock[index]);
-		ht_node_remove(data);
-		// write unlock
-		write_unlock(&g_hash_table_rwlock[index]);
+/**
+ * search node by key
+ */
+static int ht_node_search(const hash_key_t key, const hash_len_t ksize, unsigned int *ht_bucket_index, ht_data_t **data)
+{
+	int ret = HASH_NOT_FOUND;
+	ht_data_t *pos;
+	unsigned int index, size, load;
+	unsigned int rehash_idx, sizemark;
+
+	// major entry query
+	ht_table_size_lock_read(&size, &load);
+	index = ht_hash_create(key) % size;
+
+	// read lock
+	read_lock(ht.major->rwlock + index);
+
+	hlist_for_each_entry(pos, ht.major->bucket + index, hnode) {
+		if(memcmp(key, (hash_key_t)(pos->key), ksize) == 0
+				&& ksize == pos->ksize) {
+			//HT_DEBUG("major table: query key: %s, found key: %s, value: %s\n", key, pos->key, pos->value);
+			ret = HASH_IN_MAJOR;
+			break;
+		}
+	}
+	// read unlock
+	read_unlock(ht.major->rwlock + index);
+
+	// minor entry query
+	if (ret == HASH_NOT_FOUND && ht.minor != NULL
+			&& ht_table_isrehashed(&rehash_idx, &sizemark) == false) {
+		index = ht_hash_create(key) % sizemark;
+
+		if (index > rehash_idx) {
+			// read lock
+			read_lock(ht.minor->rwlock + index);
+
+			hlist_for_each_entry(pos, ht.minor->bucket + index, hnode) {
+				if (memcmp(key, (hash_key_t)(pos->key), ksize) == 0
+						&& ksize == pos->ksize) {
+					//HT_DEBUG("minor table: query key: %s, found key: %s, value: %s\n", key, pos->key, pos->value);
+					ret = HASH_IN_MINOR;
+					break;
+				}
+			}
+			// read unlock
+			read_unlock(ht.minor->rwlock + index);
+		}
 	}
 
-	// if not find exist node, copy as a new node
+	*ht_bucket_index = index;
+	*data = pos;
+
+	return ret;
+}
+
+/**
+ * transfer a node to major entry
+ */
+static void ht_node_transfer(ht_data_t *pos)
+{
+	unsigned int index, members;
+	unsigned int size, load;
+	ht_data_t *data;
+
+	if (!pos)
+		return;
+
+	ht_table_size_lock_read(&size, &load);
+	index = ht_hash_create(pos->key) % size;
+
+	// minor to major, just add
+	data = ht_node_create(pos->key, pos->ksize, pos->value, pos->vsize);
+	if (data == NULL)
+		return;
+
+	// write lock
+	write_lock(ht.major->rwlock + index);
+	// add the node to the hlist
+	hlist_add_head(&(data->hnode), ht.major->bucket + index);
+	// write unlock
+	write_unlock(ht.major->rwlock + index);
+
+	// major members increase
+	members = atomic_inc_return(&g_major_members);
+
+	// table properties updata
+	ht_table_size_lock_write(size, members * 100 / size);
+
+	return;
+}
+
+/**
+ * hash table resize
+ */
+static void ht_table_resize(int type, const unsigned int size)
+{
+	hash_entry_t tmp;
+	unsigned int members;
+	unsigned int new_size;
+
+	switch(type) {
+		case SIZE_INCRESE:
+			new_size = size * 2;
+			break;
+		case SIZE_DECRESE:
+			new_size = size / 2;
+			break;
+		default:
+			return;
+	}
+
+	//HT_INFO("resize table, old size: %d ,new size: %d\n", size, new_size);
+
+	// create a new minor entry
+	ht.minor = ht_entry_create(new_size);
+	if (!ht.minor)
+		return;
+	
+	// write lock
+	write_lock(&ht.rwlock);
+
+	// swap the major and minor
+	SWAP(*ht.major, tmp, *ht.minor);
+
+	// write unlock
+	write_unlock(&ht.rwlock);
+
+	members = atomic_read(&g_major_members);
+
+	// table properties updata
+	ht_table_size_lock_write(new_size, members * 100 / new_size);
+	ht_table_set_rehash(false, 0, size);
+
+	return;
+}
+
+/**
+ * hashtable rehash by step
+ */
+static void ht_table_rehash(void)
+{
+	ht_data_t *pos;
+	struct hlist_node *n;
+	unsigned int i, index;
+	unsigned int rehash_idx, sizemark;
+
+	if(ht_table_isrehashed(&rehash_idx, &sizemark) == false) {
+		index = rehash_idx;
+		// rehash by step
+		for(i = 0; i < HASH_TABLE_MIN_SIZE && index < sizemark; i++) {
+			// wrie lock
+			write_lock(ht.minor->rwlock + index);
+
+			hlist_for_each_entry_safe(pos, n, ht.minor->bucket + index, hnode) {
+				ht_node_transfer(pos);
+				ht_node_destroy(pos);
+				atomic_dec(&g_major_members);
+			}
+			// write unlock
+			write_unlock(ht.minor->rwlock + index);
+			index++;
+		}
+		// rehash complete
+		if(index == sizemark) {
+			ht_entry_destroy(ht.minor);
+			ht.minor = NULL;
+			ht_table_set_rehash(true, 0, 0);
+		} else {
+			ht_table_set_rehash(false, index - 1, sizemark);
+		}
+	}
+
+	return;
+}
+
+/**
+ * hash table kv data add
+ */
+void ht_data_add(const hash_key_t key, const hash_len_t ksize, const hash_value_t value, const hash_len_t vsize)
+{
+	ht_data_t *data, *pos;
+	unsigned int index;
+	unsigned int size, load;
+	bool rehashed = false;
+	unsigned int rehash_idx, sizemark;
+	int ret;
+	
+	/* rehash operations */
+	ht_table_size_lock_read(&size, &load);
+	rehashed = ht_table_isrehashed(&rehash_idx, &sizemark);
+
+	// load factor judge, change the major and minor pointer
+	if (load >= 90 && size < HASH_TABLE_MAX_SIZE && rehashed == true) {
+		ht_table_resize(SIZE_INCRESE, size);
+	} else if (load <= 10  && size > HASH_TABLE_MIN_SIZE && rehashed == true) {
+		ht_table_resize(SIZE_DECRESE, size);
+	}
+
+	if (rehashed == false) {
+		ht_table_rehash();
+	}
+
+
+	/* hash store operation */
 	data = ht_node_create(key, ksize, value, vsize);
 	if (data == NULL) return;
 
-	// write lock
-	write_lock(&g_hash_table_rwlock[index]);
-	// add the node to the hlist
-	hlist_add_head(&(data->hnode), g_hash_table + index);
-	// write unlock
-	write_unlock(&g_hash_table_rwlock[index]);
+	ret = ht_node_search(key, ksize, &index, &pos);
+
+	if (ret == HASH_IN_MAJOR) {
+		atomic_dec(&g_major_members);
+		// write lock
+		write_lock(ht.major->rwlock + index);
+		ht_node_destroy(pos);
+		// write unlock
+		write_unlock(ht.major->rwlock + index);
+	} else if (ret == HASH_IN_MINOR) {
+		// write lock
+		write_lock(ht.minor->rwlock + index);
+		ht_node_destroy(pos);
+		// write unlock
+		write_unlock(ht.minor->rwlock + index);
+	}
+
+	ht_node_transfer(data); // members will increase
 
 	return;
 }
 EXPORT_SYMBOL(ht_data_add);
 
+/**
+ * ht_data_remove - remove the key - value
+ */
 void ht_data_remove(const hash_key_t key, const hash_len_t ksize)
 {
 	unsigned int index;
-	ht_data_t *data;
+	ht_data_t *pos;
+	int ret;
+	unsigned int rehash_idx, sizemark;
 
-	if(!ht_node_search(key, ksize, &index, &data)) {
+	if (ht_table_isrehashed(&rehash_idx, &sizemark) == false) {
+		ht_table_rehash();
+	}
+
+	ret = ht_node_search(key, ksize, &index, &pos);
+	if (ret == HASH_NOT_FOUND) {
 		return;
 	}
 
 	// write lock
-	write_lock(&g_hash_table_rwlock[index]);
+	write_lock(ht.major->rwlock + index);
+	
 	// hash node del
-	ht_node_remove(data);
+	ht_node_destroy(pos);
 	//write unlock
-	write_unlock(&g_hash_table_rwlock[index]);
+	write_unlock(ht.major->rwlock + index);
+
+	// members update
+	atomic_dec(&g_major_members);
 
 	return;
 }
 EXPORT_SYMBOL(ht_data_remove);
 
-
-// query the value of the key
+/**
+ * ht_data_query - query data by key and size
+ */
 int ht_data_query(const hash_key_t key, const hash_len_t ksize, hash_value_t *value, hash_len_t *vsize) {
 	unsigned int index;
 	ht_data_t *data;
 
-	if(!ht_node_search(key, ksize, &index, &data)) {
+	if(ht_node_search(key, ksize, &index, &data) == HASH_NOT_FOUND) {
 		return -1;
 	}
 
@@ -216,7 +606,16 @@ int ht_data_query(const hash_key_t key, const hash_len_t ksize, hash_value_t *va
 }
 EXPORT_SYMBOL(ht_data_query);
 
-// page permission helper
+
+/****************************************
+ * ---								---
+ * ---		PLATFORM FUNCTIONS		---
+ * ---								---
+ ***************************************/
+
+/**
+ * set page address rw
+ */
 static void page_addr_rw(unsigned long address)
 {
 	unsigned int level;
@@ -228,6 +627,9 @@ static void page_addr_rw(unsigned long address)
 	return;
 }
 
+/**
+ * set page address ro
+ */
 static void page_addr_ro(unsigned long address)
 {
 	unsigned int level;
@@ -237,6 +639,9 @@ static void page_addr_ro(unsigned long address)
 	return;
 }
 
+/**
+ * syscall hashtable interface
+ */
 asmlinkage long sys_hashtable(int cmd, const hash_key_t key, const hash_len_t ksize, hash_value_t *value, hash_len_t *vsize)
 {
 	int ret = 0;
@@ -244,20 +649,20 @@ asmlinkage long sys_hashtable(int cmd, const hash_key_t key, const hash_len_t ks
 
 	switch(cmd) {
 		case HASH_ADD:
-			printk("hashtable: run add, key: %s, value: %s\n", key, *value);
+			HT_INFO("syscall add, key: %s, value: %s\n", key, *value);
 			ht_data_add(key, ksize, *value, *vsize);
 			break;
 		case HASH_DEL:
-			printk("hashtable: run del, key: %s\n", key);
+			HT_INFO("syscall del, key: %s\n", key);
 			ht_data_remove(key, ksize);
 			break;
 		case HASH_GET:
-			printk("hashtable: run get, key: %s\n", key);
+			HT_INFO("syscall get, key: %s\n", key);
 			ret = ht_data_query(key, ksize, value, vsize);
 			if (ret == 0) {
-				printk("hashtable: query out the value: %s\n", *value);
+				HT_INFO("syscall query out the value: %s\n", *value);
 			} else {
-				printk("hashtable: not found the key: %s\n", key);
+				HT_INFO("syscall not found the key: %s\n", key);
 			}
 			break;
 		default:
@@ -267,13 +672,16 @@ asmlinkage long sys_hashtable(int cmd, const hash_key_t key, const hash_len_t ks
 	return (long)ret;
 }
 
+/**
+ * syscall module init
+ */
 static int sys_init_module(void)
 {
 	unsigned long *p;
 	// get the syscall table address
 	g_syscall_table_addr = kallsyms_lookup_name("sys_call_table");
 	if (g_syscall_table_addr == 0) {
-		printk("hashtable: not found the sys_call_table symbol\n");
+		HT_ERR("not found the sys_call_table symbol\n");
 		return -1;
 	}
 
@@ -292,6 +700,9 @@ static int sys_init_module(void)
 	return 0;
 }
 
+/**
+ * syscall module exit
+ */
 static int sys_cleanup_module(void)
 {
 	unsigned long *p;
@@ -305,15 +716,18 @@ static int sys_cleanup_module(void)
 	return 0;
 }
 
-// read proc in user space
+/**
+ * procfs read callback
+ */
 static ssize_t proc_node_read(struct file *file, char __user *buffer, size_t count, loff_t *pos)
 {
-	ssize_t len = strlen(proc_msg);
-
-	return simple_read_from_buffer(buffer, count, pos, proc_msg, len);
+	
+	return 0;
 }
 
-// write proc in user space
+/**
+ * procfs write callback
+ */
 static ssize_t proc_node_write(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
 {
 	char msg[MAX_BUF_SIZE] = { 0 };
@@ -324,9 +738,6 @@ static ssize_t proc_node_write(struct file *file, const char __user *buffer, siz
 	hash_value_t value;
 	char *s, *p = NULL;
 
-	// clear proc msg
-	memset(proc_msg, 0, sizeof(proc_msg));
-
 	len = simple_write_to_buffer(msg, sizeof(msg), pos, buffer, count);
 	memcpy(args, msg + 4, count - 5); // no need '\n'
 	s = args;
@@ -336,7 +747,7 @@ static ssize_t proc_node_write(struct file *file, const char __user *buffer, siz
 		for(p = strsep(&s, delim); p != NULL; p = strsep(&s, delim)) {
 			key = p;
 			value = strsep(&s, delim);
-			printk("hashtable: add key: %s, value: %s\n", key, value);
+			HT_INFO("procfs add key: %s, value: %s\n", key, value);
 			ht_data_add(key, strlen(key) + 1, value, strlen(value) + 1);
 		}
 	}
@@ -344,7 +755,7 @@ static ssize_t proc_node_write(struct file *file, const char __user *buffer, siz
 	else if (strncmp("del", msg, strlen("del")) == 0) {
 		for(p = strsep(&s, delim); p != NULL; p = strsep(&s, delim)) {
 			key = p;
-			printk("hashtable: del key: %s\n", key);
+			HT_INFO("procfs del key: %s\n", key);
 			ht_data_remove(key, strlen(key) + 1);
 		}
 	}
@@ -355,9 +766,9 @@ static ssize_t proc_node_write(struct file *file, const char __user *buffer, siz
 			hash_len_t vsize;
 			key = p;
 			if(ht_data_query(key, strlen(key) + 1, &value, &vsize) == 0 ) {
-				printk("hashtable: found the key: %s, value: %s\n", key, value);
+				HT_INFO("procfs found the key: %s, value: %s\n", key, value);
 			} else {
-				printk("hashtable: not found the key: %s\n", key);
+				HT_INFO("procfs not found the key: %s\n", key);
 			}
 		}
 	}
@@ -373,12 +784,17 @@ static struct file_operations proc_node_fops = {
 
 static int __init hashtable_init(void)
 {
-	unsigned int i;
+	// initialize table flags
+	ht.size = HASH_TABLE_MIN_SIZE;
+	ht.load = 0;
+	ht.rehashed = true;
+	rwlock_init(&ht.rwlock);
 
-	// hash table bucket init	
-	for(i = 0; i < HASH_TABLE_SIZE; i++) {
-		INIT_HLIST_HEAD(g_hash_table + i);
-		rwlock_init(&g_hash_table_rwlock[i]);
+	// create a major entry
+	ht.major = ht_entry_create(HASH_TABLE_MIN_SIZE);
+	if (!ht.major) {
+		HT_ERR("failed to create hash entry\n");
+		return -1;
 	}
 
 	// system call replace
@@ -386,41 +802,35 @@ static int __init hashtable_init(void)
 
 	// procfs node create
 	if((proc_node_entry = proc_create(proc_node_name, S_IFREG | S_IRUGO | S_IWUGO, NULL, &proc_node_fops)) == NULL) {
-		printk("hashtable: failed to create proc fs node: %s\n", proc_node_name);
-		return 0;
+		HT_ERR("failed to create proc fs node: %s\n", proc_node_name);
+		return -2;
 	}
 	
-	printk("hashtable: module init success\n");
+	HT_INFO("hashtable: module init success\n");
 
 	return 0;
 }
 
 static void __exit hashtable_exit(void)
 {
-	unsigned int i;
-	ht_data_t *data;
-	struct hlist_node *tmp_hnode;
-
 	// proc node clear
 	proc_remove(proc_node_entry);
 
 	// system call revert
 	sys_cleanup_module();
 
-	// hash table clear
-	for(i = 0; i < HASH_TABLE_SIZE; i++) {
-		// write lock
-		write_lock(&g_hash_table_rwlock[i]);
-		hlist_for_each_entry_safe(data, tmp_hnode, g_hash_table + i, hnode) {
-			hlist_del_init(&(data->hnode));
-			kfree(data);
-			data = NULL;
-		}
-		// write unlock
-		write_unlock(&g_hash_table_rwlock[i]);
+	// major entry cleanup
+	if (ht.major) {
+		ht_entry_destroy(ht.major);
+		ht.major = NULL;
+	}
+	// minor entry cleanup
+	if (ht.minor) {
+		ht_entry_destroy(ht.minor);
+		ht.minor = NULL;
 	}
 
-	printk("hashtable: module exit success\n");
+	HT_INFO("hashtable: module exit success\n");
 
 	return;
 }

@@ -28,8 +28,8 @@ typedef struct bench_func {
 }bench_func_t;
 
 #define TIME_NANOSECOND (1000 * 1000 * 1000)
-#define MAX_INDEX_SIZE	(100 * 1000)
-#define MAX_THREAD_SIZE	(4)
+#define MAX_INDEX_SIZE	(4 * 1000 * 1000)
+#define MAX_THREAD_SIZE	(1)
 #define MAX_KV_SIZE		(16)
 
 extern void ht_data_add(const char *key, const unsigned int, const char *value, unsigned int);
