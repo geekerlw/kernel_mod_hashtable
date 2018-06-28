@@ -28,7 +28,7 @@ typedef struct bench_func {
 }bench_func_t;
 
 #define TIME_NANOSECOND (1000 * 1000 * 1000)
-#define MAX_INDEX_SIZE	(4 * 1000 * 1000)
+#define MAX_INDEX_SIZE	(1 * 100)
 #define MAX_THREAD_SIZE	(1)
 #define MAX_KV_SIZE		(16)
 

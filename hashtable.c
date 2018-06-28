@@ -20,7 +20,7 @@
 #include <linux/kallsyms.h>
 #include <linux/proc_fs.h>
 #include <linux/atomic.h>
-#include <asm/atomic.h>
+#include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/list.h>
@@ -57,11 +57,6 @@ enum HASH_NODE_POS {
 	HASH_IN_MINOR
 };
 
-enum HASH_TABLE_RESIZE {
-	SIZE_INCRESE,
-	SIZE_DECRESE
-};
-
 typedef char* hash_key_t;
 typedef char* hash_value_t;
 typedef unsigned int hash_len_t;
@@ -75,12 +70,10 @@ typedef struct hash_entry {
 typedef struct hash_table {
 	hash_entry_t *major;
 	hash_entry_t *minor;
-	unsigned int size;
-	unsigned int sizemark;
-	unsigned int load;
 	unsigned int rehash_idx;
 	bool rehashed;
-	rwlock_t rwlock;
+	atomic_t members;
+	struct mutex mutex;
 }hash_table_t;
 
 typedef struct ht_data {
@@ -89,16 +82,18 @@ typedef struct ht_data {
 	hash_len_t ksize;
 	hash_len_t vsize;
 	struct hlist_node hnode;
-}ht_data_t;
+}ht_data_t;	
 
-static hash_table_t ht;
-static atomic_t g_major_members = ATOMIC_INIT(0);
+static struct hash_table ht = {
+	.rehash_idx = 0,
+	.rehashed = true,
+	.members = ATOMIC_INIT(0),
+};
+static DEFINE_MUTEX(g_rehash_mutex); 
 
 static unsigned long g_syscall_fake_addr;
 static void *g_syscall_fake_func;
 static unsigned long g_syscall_table_addr;
-module_param(g_syscall_table_addr, ulong, 0);
-MODULE_PARM_DESC(g_syscall_table_addr, "syscall table address");
 
 static const char *proc_node_name = "hashtable";
 static struct proc_dir_entry *proc_node_entry;
@@ -139,13 +134,16 @@ static inline ht_data_t *ht_node_create(const hash_key_t key, const hash_len_t k
 
 	data->key = (hash_key_t) kmalloc(sizeof(hash_key_t) * ksize, GFP_KERNEL);
 	if (!data->key) {
-		kfree(data->key);
+		kfree(data);
+		data = NULL;
 		return NULL;
 	}
 	data->value = (hash_value_t) kmalloc(sizeof(hash_value_t) * vsize, GFP_KERNEL);
 	if (!data->value) {
 		kfree(data->key);
+		data->key = NULL;
 		kfree(data);
+		data = NULL;
 		return NULL;
 	}
 
@@ -199,12 +197,15 @@ static inline hash_entry_t *ht_entry_create(int size)
 	entry->bucket = (struct hlist_head*) kmalloc(sizeof(struct hlist_head) * size, GFP_KERNEL);
 	if (!entry->bucket) {
 		kfree(entry);
+		entry = NULL;
 		return NULL;
 	}
 	entry->rwlock = (rwlock_t *) kmalloc(sizeof(rwlock_t *) * size, GFP_KERNEL);
 	if (!entry->rwlock) {
 		kfree(entry->bucket);
+		entry->bucket = NULL;
 		kfree(entry);
+		entry = NULL;
 		return NULL;
 	}
 	// sub init
@@ -234,6 +235,7 @@ static void ht_entry_destroy(hash_entry_t *entry)
 
 		hlist_for_each_entry_safe(pos, n, entry->bucket + i, hnode) {
 			ht_node_destroy(pos);
+			pos = NULL;
 		};
 		// write unlock
 		write_unlock(entry->rwlock + i);
@@ -251,51 +253,17 @@ static void ht_entry_destroy(hash_entry_t *entry)
 }
 
 /**
- * hash table size lock read
- */
-static inline void ht_table_size_lock_read(unsigned int *size, unsigned int *load)
-{
-	if (!size || !load)
-		return;
-	
-	// read lock
-	read_lock(&ht.rwlock);
-	*size = ht.size;
-	*load = ht.load;
-	// read unlock
-	read_unlock(&ht.rwlock);
-
-	return;
-}
-
-/**
- * hash table size lock write
- */
-static inline void ht_table_size_lock_write(unsigned int size, unsigned int load)
-{
-	// write lock
-	write_lock(&ht.rwlock);
-	ht.size = size;
-	ht.load = load;
-	// write unlock
-	write_unlock(&ht.rwlock);
-
-	return;
-}
-
-/**
  *  whether minor hash table is rehashed complete
  */
-static inline bool ht_table_isrehashed(unsigned int *rehash_idx, unsigned int *sizemark)
+static inline bool ht_table_isrehashed(unsigned int *rehash_idx)
 {
 	bool ret;
-	// read lock
-	read_lock(&ht.rwlock);
+	// mutex lock
+	mutex_lock(&ht.mutex);
 	ret = ht.rehashed;
 	*rehash_idx = ht.rehash_idx;
-	*sizemark = ht.sizemark;
-	// read unlock
-	read_unlock(&ht.rwlock);
+	// mutex unlock
+	mutex_unlock(&ht.mutex);
 
 	return ret;
 }
@@ -303,15 +271,14 @@ static inline bool ht_table_isrehashed(unsigned int *rehash_idx, unsigned int *s
 /**
  * updata minor table rehash state
  */
-static inline void ht_table_set_rehash(bool rehashed, const unsigned int rehash_idx, const unsigned int sizemark)
+static inline void ht_table_set_rehashed(bool rehashed, const unsigned int rehash_idx)
 {
-	// write lock
-	write_lock(&ht.rwlock);
+	// mutex lock
+	mutex_lock(&ht.mutex);
 	ht.rehashed = rehashed;
 	ht.rehash_idx = rehash_idx;
-	ht.sizemark = sizemark;
-	// write unlock
-	write_unlock(&ht.rwlock);
+	// mutex unlock
+	mutex_unlock(&ht.mutex);
 
 	return;
 }
@@ -329,13 +296,11 @@ static inline void ht_table_set_rehash(bool rehashed, const unsigned int rehash_
 static int ht_node_search(const hash_key_t key, const hash_len_t ksize, unsigned int *ht_bucket_index, ht_data_t **data)
 {
 	int ret = HASH_NOT_FOUND;
+	unsigned int index, rehash_idx;
 	ht_data_t *pos;
-	unsigned int index, size, load;
-	unsigned int rehash_idx, sizemark;
 
 	// major entry query
-	ht_table_size_lock_read(&size, &load);
-	index = ht_hash_create(key) % size;
+	index = ht_hash_create(key) % ht.major->size;
 
 	// read lock
 	read_lock(ht.major->rwlock + index);
@@ -352,16 +317,15 @@ static int ht_node_search(const hash_key_t key, const hash_len_t ksize, unsigned
 	read_unlock(ht.major->rwlock + index);
 
 	// minor entry query
-	if (ret == HASH_NOT_FOUND && ht.minor != NULL
-			&& ht_table_isrehashed(&rehash_idx, &sizemark) == false) {
-		index = ht_hash_create(key) % sizemark;
-
+	if (ret == HASH_NOT_FOUND && ht_table_isrehashed(&rehash_idx) == false) {
+		// create minor hash
+		index = ht_hash_create(key) % ht.minor->size;
 		if (index > rehash_idx) {
 			// read lock
 			read_lock(ht.minor->rwlock + index);
 
 			hlist_for_each_entry(pos, ht.minor->bucket + index, hnode) {
-				if (memcmp(key, (hash_key_t)(pos->key), ksize) == 0
+				if (memcmp(key, (hash_key_t)(pos->key), ksize) == 0 
 						&& ksize == pos->ksize) {
 					//HT_DEBUG("minor table: query key: %s, found key: %s, value: %s\n", key, pos->key, pos->value);
 					ret = HASH_IN_MINOR;
@@ -384,20 +348,18 @@ static int ht_node_search(const hash_key_t key, const hash_len_t ksize, unsigned
  */
 static void ht_node_transfer(ht_data_t *pos)
 {
-	unsigned int index, members;
-	unsigned int size, load;
+	unsigned int index;
 	ht_data_t *data;
 
 	if (!pos)
 		return;
 
-	ht_table_size_lock_read(&size, &load);
-	index = ht_hash_create(pos->key) % size;
-
 	// minor to major, just add
 	data = ht_node_create(pos->key, pos->ksize, pos->value, pos->vsize);
 	if (data == NULL)
 		return;
+
+	index = ht_hash_create(pos->key) % ht.major->size;
 
 	// write lock
 	write_lock(ht.major->rwlock + index);
@@ -406,56 +368,30 @@ static void ht_node_transfer(ht_data_t *pos)
 	// write unlock
 	write_unlock(ht.major->rwlock + index);
 
-	// major members increase
-	members = atomic_inc_return(&g_major_members);
-
-	// table properties updata
-	ht_table_size_lock_write(size, members * 100 / size);
-
 	return;
 }
 
 /**
  * hash table resize
  */
-static void ht_table_resize(int type, const unsigned int size)
+static void ht_table_resize(const unsigned int size)
 {
 	hash_entry_t tmp;
-	unsigned int members;
-	unsigned int new_size;
-
-	switch(type) {
-		case SIZE_INCRESE:
-			new_size = size * 2;
-			break;
-		case SIZE_DECRESE:
-			new_size = size / 2;
-			break;
-		default:
-			return;
-	}
-
-	//HT_INFO("resize table, old size: %d ,new size: %d\n", size, new_size);
 
 	// create a new minor entry
-	ht.minor = ht_entry_create(new_size);
+	ht.minor = ht_entry_create(size);
 	if (!ht.minor)
 		return;
 	
-	// write lock
-	write_lock(&ht.rwlock);
-
+	// mutex lock
+	mutex_lock(&ht.mutex);
 	// swap the major and minor
 	SWAP(*ht.major, tmp, *ht.minor);
+	// mutex unlock
+	mutex_unlock(&ht.mutex);
 
-	// write unlock
-	write_unlock(&ht.rwlock);
-
-	members = atomic_read(&g_major_members);
-
-	// table properties updata
-	ht_table_size_lock_write(new_size, members * 100 / new_size);
-	ht_table_set_rehash(false, 0, size);
+	// rehash start
+	ht_table_set_rehashed(false, 0);
 
 	return;
 }
@@ -467,32 +403,47 @@ static void ht_table_rehash(void)
 {
 	ht_data_t *pos;
 	struct hlist_node *n;
-	unsigned int i, index;
-	unsigned int rehash_idx, sizemark;
+	unsigned int i, index, rehash_idx;
+	unsigned int load, size;
+	bool rehashed;
 
-	if(ht_table_isrehashed(&rehash_idx, &sizemark) == false) {
+	size = ht.major->size;
+	load = atomic_read(&ht.members) * 100 / ht.major->size;
+	rehashed = ht_table_isrehashed(&rehash_idx);
+
+	HT_DEBUG("rehash in, size: %d, members: %d, load: %d, rehashed: %d, idx: %d\n", size, atomic_read(&ht.members), load, (int)rehashed, rehash_idx);
+	
+	if (rehashed) {
+		// load factor judge, swap the major and minor address
+		if (load >= 90 && size < HASH_TABLE_MAX_SIZE) {
+			printk("debug: increase size\n");
+			ht_table_resize(size * 2);
+		} else if (load <= 10  && size > HASH_TABLE_MIN_SIZE) {
+			printk("debug: decrese size\n");
+			ht_table_resize(size / 2);
+		}
+	} else {
 		index = rehash_idx;
 		// rehash by step
-		for(i = 0; i < HASH_TABLE_MIN_SIZE && index < sizemark; i++) {
-			// wrie lock
-			write_lock(ht.minor->rwlock + index);
-
+		for(i = 0; i < HASH_TABLE_MIN_SIZE && index < ht.minor->size; i++) {
+			// read lock
+			read_lock(ht.minor->rwlock + index);
+	
 			hlist_for_each_entry_safe(pos, n, ht.minor->bucket + index, hnode) {
 				ht_node_transfer(pos);
-				ht_node_destroy(pos);
-				atomic_dec(&g_major_members);
 			}
 			// write unlock
-			write_unlock(ht.minor->rwlock + index);
+			read_unlock(ht.major->rwlock + index);
 			index++;
 		}
-		// rehash complete
-		if(index == sizemark) {
+
+		if (index == ht.minor->size) {
+			// rehash complete
+			ht_table_set_rehashed(true, 0);
 			ht_entry_destroy(ht.minor);
 			ht.minor = NULL;
-			ht_table_set_rehash(true, 0, 0);
 		} else {
-			ht_table_set_rehash(false, index - 1, sizemark);
+			ht_table_set_rehashed(false, index - 1);
 		}
 	}
 
@@ -506,26 +457,12 @@ void ht_data_add(const hash_key_t key, const hash_len_t ksize, const hash_value_
 {
 	ht_data_t *data, *pos;
 	unsigned int index;
-	unsigned int size, load;
-	bool rehashed = false;
-	unsigned int rehash_idx, sizemark;
 	int ret;
 	
 	/* rehash operations */
-	ht_table_size_lock_read(&size, &load);
-	rehashed = ht_table_isrehashed(&rehash_idx, &sizemark);
-
-	// load factor judge, change the major and minor pointer
-	if (load >= 90 && size < HASH_TABLE_MAX_SIZE && rehashed == true) {
-		ht_table_resize(SIZE_INCRESE, size);
-	} else if (load <= 10  && size > HASH_TABLE_MIN_SIZE && rehashed == true) {
-		ht_table_resize(SIZE_DECRESE, size);
-	}
-
-	if (rehashed == false) {
-		ht_table_rehash();
-	}
-
+//	mutex_lock(&g_rehash_mutex);
+	ht_table_rehash();
+//	mutex_unlock(&g_rehash_mutex);
 
 	/* hash store operation */
 	data = ht_node_create(key, ksize, value, vsize);
@@ -534,21 +471,25 @@ void ht_data_add(const hash_key_t key, const hash_len_t ksize, const hash_value_
 	ret = ht_node_search(key, ksize, &index, &pos);
 
 	if (ret == HASH_IN_MAJOR) {
-		atomic_dec(&g_major_members);
 		// write lock
 		write_lock(ht.major->rwlock + index);
 		ht_node_destroy(pos);
+		pos = NULL;
 		// write unlock
 		write_unlock(ht.major->rwlock + index);
 	} else if (ret == HASH_IN_MINOR) {
 		// write lock
 		write_lock(ht.minor->rwlock + index);
 		ht_node_destroy(pos);
+		pos = NULL;
 		// write unlock
 		write_unlock(ht.minor->rwlock + index);
+	} else {
+		// not found, member increase
+		atomic_inc(&ht.members);
 	}
 
-	ht_node_transfer(data); // members will increase
+	ht_node_transfer(data);
 
 	return;
 }
@@ -562,11 +503,11 @@ void ht_data_remove(const hash_key_t key, const hash_len_t ksize)
 	unsigned int index;
 	ht_data_t *pos;
 	int ret;
-	unsigned int rehash_idx, sizemark;
 
-	if (ht_table_isrehashed(&rehash_idx, &sizemark) == false) {
-		ht_table_rehash();
-	}
+	/* rehash operations */
+//	mutex_lock(&g_rehash_mutex);
+	ht_table_rehash();
+//	mutex_unlock(&g_rehash_mutex);
 
 	ret = ht_node_search(key, ksize, &index, &pos);
 	if (ret == HASH_NOT_FOUND) {
@@ -578,11 +519,12 @@ void ht_data_remove(const hash_key_t key, const hash_len_t ksize)
 	
 	// hash node del
 	ht_node_destroy(pos);
+	pos = NULL;
 	//write unlock
 	write_unlock(ht.major->rwlock + index);
 
 	// members update
-	atomic_dec(&g_major_members);
+	atomic_dec(&ht.members);
 
 	return;
 }
@@ -784,11 +726,8 @@ static struct file_operations proc_node_fops = {
 
 static int __init hashtable_init(void)
 {
-	// initialize table flags
-	ht.size = HASH_TABLE_MIN_SIZE;
-	ht.load = 0;
-	ht.rehashed = true;
-	rwlock_init(&ht.rwlock);
+	// mutex init
+	mutex_init(&ht.mutex);
 
 	// create a major entry
 	ht.major = ht_entry_create(HASH_TABLE_MIN_SIZE);
