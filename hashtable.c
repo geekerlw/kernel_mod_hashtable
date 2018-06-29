@@ -656,8 +656,23 @@ static int sys_cleanup_module(void)
  */
 static ssize_t proc_node_read(struct file *file, char __user *buffer, size_t count, loff_t *pos)
 {
-	
-	return 0;
+	int i;
+	ht_data_t *node;
+	char msg[MAX_BUF_SIZE] = { 0 };
+
+	sprintf(msg, "Please see all store members by `dmesg`\n");
+
+	for(i = 0; i < ht.major->size; i++) {
+		read_lock(ht.major->rwlock + i);
+
+		hlist_for_each_entry(node, ht.major->bucket + i, hnode) {
+			HT_INFO("bucket: %d, key: %s, value: %s\n", i, node->key, node->value);
+		}
+
+		read_unlock(ht.major->rwlock + i);
+	}
+
+	return simple_read_from_buffer(buffer, count, pos, msg, strlen(msg));;
 }
 
 /**
