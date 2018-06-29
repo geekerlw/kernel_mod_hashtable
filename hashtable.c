@@ -26,6 +26,8 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 
+#include "hashtable.h"
+
 #define HASH_TABLE_MIN_SIZE	(8)
 #define HASH_TABLE_MAX_SIZE	(INT_MAX)
 #define HASH_KEY_MAX_LEN	(256)
@@ -44,44 +46,6 @@
     printk(KERN_DEBUG "hashtable - %s[%04u]: " fmt, __func__, __LINE__, ##__VA_ARGS__)
 
 #define SYSCALL_FAKE_NUM	(223)
-
-enum HASH_CMD {
-	HASH_ADD,
-	HASH_DEL,
-	HASH_GET
-};
-
-enum HASH_NODE_POS {
-	HASH_NOT_FOUND,
-	HASH_IN_MAJOR,
-	HASH_IN_MINOR
-};
-
-typedef char* hash_key_t;
-typedef char* hash_value_t;
-typedef unsigned int hash_len_t;
-
-typedef struct hash_entry {
-	struct hlist_head *bucket;
-	rwlock_t *rwlock;
-	unsigned int size;
-}hash_entry_t;
-
-typedef struct hash_table {
-	hash_entry_t *major;
-	hash_entry_t *minor;
-	unsigned int members;
-	struct mutex mutex;
-	rwlock_t rwlock;
-}hash_table_t;
-
-typedef struct ht_data {
-	hash_key_t key;
-	hash_value_t value;
-	hash_len_t ksize;
-	hash_len_t vsize;
-	struct hlist_node hnode;
-}ht_data_t;
 
 static hash_table_t ht;
 
@@ -130,13 +94,16 @@ static inline ht_data_t *ht_node_create(const hash_key_t key, const hash_len_t k
 
 	data->key = (hash_key_t) kmalloc(sizeof(hash_key_t) * ksize, GFP_KERNEL);
 	if (!data->key) {
-		kfree(data->key);
+		kfree(data);
+		data = NULL;
 		return NULL;
 	}
 	data->value = (hash_value_t) kmalloc(sizeof(hash_value_t) * vsize, GFP_KERNEL);
 	if (!data->value) {
 		kfree(data->key);
+		data->key = NULL;
 		kfree(data);
+		data = NULL;
 		return NULL;
 	}
 
@@ -190,12 +157,15 @@ static inline hash_entry_t *ht_entry_create(int size)
 	entry->bucket = (struct hlist_head*) kmalloc(sizeof(struct hlist_head) * size, GFP_KERNEL);
 	if (!entry->bucket) {
 		kfree(entry);
+		entry = NULL;
 		return NULL;
 	}
 	entry->rwlock = (rwlock_t *) kmalloc(sizeof(rwlock_t *) * size, GFP_KERNEL);
 	if (!entry->rwlock) {
 		kfree(entry->bucket);
+		entry->bucket = NULL;
 		kfree(entry);
+		entry = NULL;
 		return NULL;
 	}
 	// sub init
@@ -241,6 +211,9 @@ static void ht_entry_destroy(hash_entry_t *entry)
 	return;
 }
 
+/**
+ * hashtable load factor count
+ */
 static inline unsigned int ht_table_load_get(void)
 {
 	unsigned int load;
@@ -253,7 +226,9 @@ static inline unsigned int ht_table_load_get(void)
 	return load;
 }
 
-
+/**
+ * hashtable members count
+ */
 static inline unsigned int ht_table_members_get(void)
 {
 	unsigned int members;
@@ -266,6 +241,9 @@ static inline unsigned int ht_table_members_get(void)
 	return members;
 }
 
+/**
+ * hashtable member increse
+ */
 static inline void ht_table_members_inc(void)
 {
 	// write lock
@@ -277,6 +255,9 @@ static inline void ht_table_members_inc(void)
 	return;
 }
 
+/**
+ * hashtable member decrese
+ */
 static inline void ht_table_members_dec(void)
 {
 	// write lock
@@ -407,6 +388,7 @@ static void ht_table_rehash(void)
 
 	ht_entry_destroy(ht.minor);
 	ht.minor = NULL;
+
 	HT_INFO("hashtable rehash complete\n");
 
 	return;
@@ -464,6 +446,7 @@ void ht_data_add(const hash_key_t key, const hash_len_t ksize, const hash_value_
 	if (load >= 90 && ht.major->size < HASH_TABLE_MAX_SIZE) {
 		ht_table_resize(ht.major->size * 2);
 	}
+	// rehash unlock
 	mutex_unlock(&ht.mutex);
 
 	/* hash store operation */
@@ -514,6 +497,7 @@ void ht_data_remove(const hash_key_t key, const hash_len_t ksize)
 		ht_table_resize(ht.major->size / 2);
 	}
 
+	// rehash unlock
 	mutex_unlock(&ht.mutex);
 
 	//HT_DEBUG("del key: %s, table size: %d, members: %d, load: %d\n", key, ht.major->size, ht_table_members_get(), load);
@@ -596,7 +580,7 @@ static void page_addr_ro(unsigned long address)
 asmlinkage long sys_hashtable(int cmd, const hash_key_t key, const hash_len_t ksize, hash_value_t *value, hash_len_t *vsize)
 {
 	int ret = 0;
-	printk("hashtable: call the hashtable via syscall\n");
+	HT_INFO("hashtable: call the hashtable via syscall\n");
 
 	switch(cmd) {
 		case HASH_ADD:
