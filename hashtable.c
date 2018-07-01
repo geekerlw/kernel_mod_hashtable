@@ -610,7 +610,7 @@ asmlinkage long sys_hashtable(int cmd, const hash_key_t key, const hash_len_t ks
 /**
  * syscall module init
  */
-static int sys_init_module(void)
+static int sys_hashtable_init(void)
 {
 	unsigned long *p;
 	// get the syscall table address
@@ -638,7 +638,7 @@ static int sys_init_module(void)
 /**
  * syscall module exit
  */
-static int sys_cleanup_module(void)
+static int sys_hashtable_cleanup(void)
 {
 	unsigned long *p;
 	p = (unsigned long *)g_syscall_fake_addr;
@@ -747,7 +747,7 @@ static int __init hashtable_init(void)
 	}
 
 	// system call replace
-	sys_init_module();
+	sys_hashtable_init();
 
 	// procfs node create
 	if((proc_node_entry = proc_create(proc_node_name, S_IFREG | S_IRUGO | S_IWUGO, NULL, &proc_node_fops)) == NULL) {
@@ -766,7 +766,7 @@ static void __exit hashtable_exit(void)
 	proc_remove(proc_node_entry);
 
 	// system call revert
-	sys_cleanup_module();
+	sys_hashtable_cleanup();
 
 	// major entry cleanup
 	if (ht.major) {
