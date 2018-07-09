@@ -154,13 +154,13 @@ static inline hash_entry_t *ht_entry_create(int size)
 
 	entry->size = size;
 
-	entry->bucket = (struct hlist_head*) vmalloc(sizeof(struct hlist_head) * size);
+	entry->bucket = (struct hlist_head *) vmalloc(sizeof(struct hlist_head) * size);
 	if (!entry->bucket) {
 		kfree(entry);
 		entry = NULL;
 		return NULL;
 	}
-	entry->rwlock = (rwlock_t *) vmalloc(sizeof(rwlock_t *) * size);
+	entry->rwlock = (rwlock_t *) vmalloc(sizeof(rwlock_t) * size);
 	if (!entry->rwlock) {
 		vfree(entry->bucket);
 		entry->bucket = NULL;
