@@ -287,7 +287,9 @@ static int ht_node_search(const hash_key_t key, const hash_len_t ksize, unsigned
 	// major entry query
 	index = ht_hash_create(key) % ht.major->size;
 
+
 	// read lock
+	read_lock(&ht.rwlock);
 	read_lock(ht.major->rwlock + index);
 
 	hlist_for_each_entry(pos, ht.major->bucket + index, hnode) {
@@ -300,6 +302,7 @@ static int ht_node_search(const hash_key_t key, const hash_len_t ksize, unsigned
 	}
 	// read unlock
 	read_unlock(ht.major->rwlock + index);
+	read_unlock(&ht.rwlock);
 
 	/*
 	// minor entry query
